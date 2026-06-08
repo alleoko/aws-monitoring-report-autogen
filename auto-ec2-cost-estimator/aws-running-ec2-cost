@@ -1,0 +1,966 @@
+"""
+AWS Cost Report by EC2 Instance ID
+Generates a single-sheet Excel report for all resources linked to a given Instance ID.
+
+Prerequisites:
+    pip install boto3 openpyxl pandas
+
+AWS Credentials:
+    Configure via: aws configure  OR  set environment variables:
+        AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN (optional)
+
+HOW TO RUN:
+    1. Fill in the CONFIG block below (INSTANCE_ID, REGION, dates, etc.)
+    2. Run:  python aws_cost_report.py
+"""
+
+# =============================================================================
+# CONFIG — edit these values, then run:  python aws_cost_report.py
+# =============================================================================
+
+# Leave INSTANCE_ID = "" to be prompted at runtime
+INSTANCE_ID = "i-0568b218569ec80e0"                  # e.g. "i-0abc123def456789"
+
+# Leave REGION = "" to use your default AWS CLI profile region
+REGION = "ap-southeast-1"                       # e.g. "us-east-1"
+
+# Leave AWS_PROFILE = "" to use the default AWS CLI profile
+AWS_PROFILE = "alejo-nerve"                  # e.g. "my-profile"
+
+# Billing period — leave blank to use last 30 days automatically
+START_DATE = ""                   # e.g. "2026-05-09"  (blank = today minus 30 days)
+END_DATE   = ""                   # e.g. "2026-06-08"  (blank = today)
+DAYS_BACK  = 30                   # used only when START_DATE/END_DATE are blank
+
+# --- AUTO-DISCOVERED via instance ID (no config needed) -------------------
+# EC2, EBS Volumes, EBS Snapshots, Elastic IPs
+
+# --- AUTO-DISCOVERED via Security Group match (no config needed) ----------
+# Load Balancers, NAT Gateways, RDS, ElastiCache, CloudWatch, Data Transfer
+
+# Output Excel filename — timestamp is appended automatically to avoid file-lock errors
+OUTPUT_FILE = "aws_cost_report"   # do NOT include .xlsx here
+
+# =============================================================================
+
+import argparse
+import sys
+import os
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+import traceback
+
+import subprocess
+
+def _ensure(package: str, import_name: str = None):
+    import importlib
+    name = import_name or package
+    try:
+        importlib.import_module(name)
+    except ImportError:
+        print(f"[SETUP] Installing {package}...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package, "-q"])
+
+_ensure("boto3")
+_ensure("pandas")
+_ensure("openpyxl")
+
+import boto3
+from botocore.exceptions import ClientError, NoCredentialsError
+import pandas as pd  # type: ignore
+from openpyxl import load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+
+# ---------------------------------------------------------------------------
+# CLI argument parsing
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="AWS Cost Report by EC2 Instance ID")
+
+    # NOTE: --instance-id, --region, and AWS CLI credentials intentionally left
+    # optional so the script can be run without hard-coded values.
+    parser.add_argument(
+        "--instance-id",
+        default=None,
+        help="EC2 Instance ID (e.g. i-0abc123def456789). Leave blank to prompt.",
+    )
+    parser.add_argument(
+        "--region",
+        default=None,
+        help="AWS region (e.g. us-east-1). Leave blank to use default profile region.",
+    )
+    parser.add_argument(
+        "--start",
+        default=None,
+        help="Billing period start date YYYY-MM-DD. Defaults to 30 days ago.",
+    )
+    parser.add_argument(
+        "--end",
+        default=None,
+        help="Billing period end date YYYY-MM-DD. Defaults to today.",
+    )
+    parser.add_argument(
+        "--output",
+        default="aws_cost_report.xlsx",
+        help="Output Excel filename (default: aws_cost_report.xlsx)",
+    )
+    parser.add_argument(
+        "--profile",
+        default=None,
+        help="AWS CLI profile name (optional). Leave blank to use default.",
+    )
+    return parser.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# AWS session helpers
+# ---------------------------------------------------------------------------
+
+def create_session(profile: str | None, region: str | None):
+    kwargs = {}
+    if profile:
+        kwargs["profile_name"] = profile
+    if region:
+        kwargs["region_name"] = region
+    try:
+        session = boto3.Session(**kwargs)
+        # Quick credential check
+        sts = session.client("sts")
+        identity = sts.get_caller_identity()
+        print(f"[AUTH] Connected as: {identity['Arn']}")
+        return session
+    except NoCredentialsError:
+        sys.exit(
+            "ERROR: No AWS credentials found.\n"
+            "Run 'aws configure' or set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY env vars."
+        )
+    except ClientError as e:
+        sys.exit(f"ERROR: AWS authentication failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# EC2 resource discovery
+# ---------------------------------------------------------------------------
+
+def get_instance_details(ec2_client, instance_id: str) -> dict:
+    """Fetch core metadata for the EC2 instance."""
+    try:
+        resp = ec2_client.describe_instances(InstanceIds=[instance_id])
+        reservations = resp.get("Reservations", [])
+        if not reservations:
+            sys.exit(f"ERROR: Instance {instance_id} not found in this region/account.")
+        inst = reservations[0]["Instances"][0]
+        return inst
+    except ClientError as e:
+        sys.exit(f"ERROR fetching instance details: {e}")
+
+
+def tag_value(tags: list, key: str) -> str:
+    for t in (tags or []):
+        if t["Key"] == key:
+            return t["Value"]
+    return ""
+
+
+def get_ebs_volumes(ec2_client, instance_id: str) -> list[dict]:
+    resp = ec2_client.describe_volumes(
+        Filters=[{"Name": "attachment.instance-id", "Values": [instance_id]}]
+    )
+    return resp.get("Volumes", [])
+
+
+def get_ebs_snapshots(ec2_client, volume_ids: list[str], account_id: str) -> list[dict]:
+    if not volume_ids:
+        return []
+    snapshots = []
+    for vid in volume_ids:
+        resp = ec2_client.describe_snapshots(
+            Filters=[{"Name": "volume-id", "Values": [vid]}],
+            OwnerIds=[account_id],
+        )
+        snapshots.extend(resp.get("Snapshots", []))
+    return snapshots
+
+
+def get_elastic_ips(ec2_client, instance_id: str) -> list[dict]:
+    resp = ec2_client.describe_addresses(
+        Filters=[{"Name": "instance-id", "Values": [instance_id]}]
+    )
+    return resp.get("Addresses", [])
+
+
+def get_load_balancers(session, sg_ids: list[str]) -> list[dict]:
+    """Find ELBv2 load balancers that share at least one Security Group with the instance."""
+    elb_client = session.client("elbv2")
+    sg_set = set(sg_ids)
+    matched = []
+    try:
+        paginator = elb_client.get_paginator("describe_load_balancers")
+        for page in paginator.paginate():
+            for lb in page["LoadBalancers"]:
+                lb_sgs = set(lb.get("SecurityGroups", []))
+                if lb_sgs & sg_set:
+                    matched.append(lb)
+    except ClientError:
+        pass
+    return matched
+
+
+def get_nat_gateways(ec2_client, sg_ids: list[str]) -> list[dict]:
+    """NAT Gateways don't have SGs; find ones in subnets used by ENIs sharing the instance's SGs."""
+    matched = []
+    try:
+        # Find ENIs that share any of the instance's security groups
+        resp = ec2_client.describe_network_interfaces(
+            Filters=[{"Name": "group-id", "Values": sg_ids}]
+        )
+        subnet_ids = {eni["SubnetId"] for eni in resp.get("NetworkInterfaces", []) if "SubnetId" in eni}
+        if subnet_ids:
+            ngw_resp = ec2_client.describe_nat_gateways(
+                Filters=[{"Name": "subnet-id", "Values": list(subnet_ids)}]
+            )
+            matched = ngw_resp.get("NatGateways", [])
+    except ClientError:
+        pass
+    return matched
+
+
+def get_rds_instances(session, sg_ids: list[str]) -> list[dict]:
+    """Find RDS instances sharing at least one Security Group with the EC2 instance."""
+    rds    = session.client("rds")
+    sg_set = set(sg_ids)
+    matched = []
+    try:
+        paginator = rds.get_paginator("describe_db_instances")
+        for page in paginator.paginate():
+            for db in page["DBInstances"]:
+                db_sgs = {sg["VpcSecurityGroupId"] for sg in db.get("VpcSecurityGroups", [])}
+                if db_sgs & sg_set:
+                    matched.append(db)
+    except ClientError:
+        pass
+    return matched
+
+
+# ---------------------------------------------------------------------------
+# Additional resource discovery functions
+# ---------------------------------------------------------------------------
+
+def get_s3_buckets(session, bucket_names: list[str]) -> list[dict]:
+    if not bucket_names:
+        return []
+    s3 = session.client("s3")
+    result = []
+    for name in bucket_names:
+        try:
+            loc = s3.get_bucket_location(Bucket=name)
+            size_resp = s3.list_objects_v2(Bucket=name)
+            total_bytes = sum(o["Size"] for o in size_resp.get("Contents", []))
+            result.append({"Name": name, "Region": loc.get("LocationConstraint") or "us-east-1", "SizeGB": round(total_bytes / 1_073_741_824, 4)})
+        except ClientError as e:
+            print(f"[WARN] S3 bucket '{name}' not accessible: {e}")
+    return result
+
+
+def get_elasticache_clusters(session, sg_ids: list[str]) -> list[dict]:
+    """Find ElastiCache clusters sharing at least one Security Group with the EC2 instance."""
+    ec_client = session.client("elasticache")
+    sg_set    = set(sg_ids)
+    matched   = []
+    try:
+        paginator = ec_client.get_paginator("describe_cache_clusters")
+        for page in paginator.paginate(ShowCacheNodeInfo=True):
+            for cluster in page["CacheClusters"]:
+                cluster_sgs = {sg["SecurityGroupId"] for sg in cluster.get("SecurityGroups", [])}
+                if cluster_sgs & sg_set:
+                    cluster["_matched_sgs"] = list(cluster_sgs & sg_set)
+                    matched.append(cluster)
+    except ClientError:
+        pass
+    return matched
+
+
+def get_secrets(session, secret_ids: list[str]) -> list[dict]:
+    if not secret_ids:
+        return []
+    sm = session.client("secretsmanager")
+    result = []
+    for sid in secret_ids:
+        try:
+            resp = sm.describe_secret(SecretId=sid)
+            result.append(resp)
+        except ClientError as e:
+            print(f"[WARN] Secret '{sid}' not accessible: {e}")
+    return result
+
+
+def get_kms_keys(session, key_ids: list[str]) -> list[dict]:
+    if not key_ids:
+        return []
+    kms = session.client("kms")
+    result = []
+    for kid in key_ids:
+        try:
+            resp = kms.describe_key(KeyId=kid)
+            result.append(resp.get("KeyMetadata", {}))
+        except ClientError as e:
+            print(f"[WARN] KMS key '{kid}' not accessible: {e}")
+    return result
+
+
+def get_vpc_endpoints(session, endpoint_ids: list[str]) -> list[dict]:
+    if not endpoint_ids:
+        return []
+    ec2 = session.client("ec2")
+    try:
+        resp = ec2.describe_vpc_endpoints(VpcEndpointIds=endpoint_ids)
+        return resp.get("VpcEndpoints", [])
+    except ClientError as e:
+        print(f"[WARN] VPC endpoints not accessible: {e}")
+        return []
+
+
+def get_sqs_queues(session, queue_names: list[str]) -> list[dict]:
+    if not queue_names:
+        return []
+    sqs = session.client("sqs")
+    result = []
+    for qname in queue_names:
+        try:
+            url_resp = sqs.get_queue_url(QueueName=qname)
+            url = url_resp["QueueUrl"]
+            attrs = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["All"])
+            result.append({"Name": qname, "Url": url, "Attributes": attrs.get("Attributes", {})})
+        except ClientError as e:
+            print(f"[WARN] SQS queue '{qname}' not accessible: {e}")
+    return result
+
+
+def get_sns_topics(session, topic_arns: list[str]) -> list[dict]:
+    if not topic_arns:
+        return []
+    sns = session.client("sns")
+    result = []
+    for arn in topic_arns:
+        try:
+            attrs = sns.get_topic_attributes(TopicArn=arn)
+            result.append({"Arn": arn, "Attributes": attrs.get("Attributes", {})})
+        except ClientError as e:
+            print(f"[WARN] SNS topic '{arn}' not accessible: {e}")
+    return result
+
+
+def get_ecr_repos(session, repo_names: list[str]) -> list[dict]:
+    if not repo_names:
+        return []
+    ecr = session.client("ecr")
+    result = []
+    for rname in repo_names:
+        try:
+            resp = ecr.describe_repositories(repositoryNames=[rname])
+            repos = resp.get("repositories", [])
+            for repo in repos:
+                # Get image sizes
+                images = ecr.describe_images(repositoryName=rname).get("imageDetails", [])
+                total_bytes = sum(i.get("imageSizeInBytes", 0) for i in images)
+                repo["TotalSizeGB"] = round(total_bytes / 1_073_741_824, 4)
+                result.append(repo)
+        except ClientError as e:
+            print(f"[WARN] ECR repo '{rname}' not accessible: {e}")
+    return result
+
+
+def get_backup_plans(session, plan_ids: list[str]) -> list[dict]:
+    if not plan_ids:
+        return []
+    backup = session.client("backup")
+    result = []
+    for pid in plan_ids:
+        try:
+            resp = backup.get_backup_plan(BackupPlanId=pid)
+            result.append(resp.get("BackupPlan", {}))
+        except ClientError as e:
+            print(f"[WARN] Backup plan '{pid}' not accessible: {e}")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Route 53 discovery
+# ---------------------------------------------------------------------------
+
+def get_route53_records(session, public_ips: list[str], elb_dns_names: list[str]) -> list[dict]:
+    """
+    Scan all Route 53 hosted zones for records pointing to this instance's
+    public IPs (A records) or ELB DNS names (ALIAS / CNAME records).
+    Returns list of dicts: {zone_id, zone_name, record_name, record_type, target}
+    """
+    r53     = session.client("route53")
+    ip_set  = set(public_ips)
+    # Normalise ELB DNS names for matching (strip trailing dot, lowercase)
+    elb_set = {d.rstrip(".").lower() for d in elb_dns_names}
+    found   = []
+    try:
+        zones = r53.list_hosted_zones().get("HostedZones", [])
+        for zone in zones:
+            zone_id   = zone["Id"].split("/")[-1]
+            zone_name = zone["Name"]
+            paginator = r53.get_paginator("list_resource_record_sets")
+            for page in paginator.paginate(HostedZoneId=zone_id):
+                for rr in page["ResourceRecordSets"]:
+                    rtype = rr["ResourceRecords"] if "ResourceRecords" in rr else []
+                    alias = rr.get("AliasTarget", {})
+
+                    # A record pointing directly to instance IP
+                    for val in rtype:
+                        if rr["Type"] == "A" and val["Value"] in ip_set:
+                            found.append({"zone_id": zone_id, "zone_name": zone_name,
+                                          "record_name": rr["Name"], "record_type": "A",
+                                          "target": val["Value"]})
+
+                    # ALIAS record pointing to an ELB
+                    alias_dns = alias.get("DNSName", "").rstrip(".").lower()
+                    if alias_dns and any(alias_dns.endswith(e) or e.endswith(alias_dns) for e in elb_set):
+                        found.append({"zone_id": zone_id, "zone_name": zone_name,
+                                      "record_name": rr["Name"], "record_type": "ALIAS",
+                                      "target": alias.get("DNSName", "")})
+
+                    # CNAME pointing to an ELB
+                    for val in rtype:
+                        if rr["Type"] == "CNAME":
+                            cname_val = val["Value"].rstrip(".").lower()
+                            if any(cname_val.endswith(e) or e.endswith(cname_val) for e in elb_set):
+                                found.append({"zone_id": zone_id, "zone_name": zone_name,
+                                              "record_name": rr["Name"], "record_type": "CNAME",
+                                              "target": val["Value"]})
+    except ClientError as e:
+        print(f"[WARN] Route 53 not accessible: {e}")
+    return found
+
+
+# ---------------------------------------------------------------------------
+# CloudWatch log group costs (estimated)
+# ---------------------------------------------------------------------------
+
+def get_cloudwatch_log_groups(logs_client, instance_id: str) -> list[str]:
+    matched = []
+    try:
+        paginator = logs_client.get_paginator("describe_log_groups")
+        for page in paginator.paginate():
+            for lg in page["logGroups"]:
+                if instance_id in lg.get("logGroupName", ""):
+                    matched.append(lg["logGroupName"])
+    except ClientError:
+        pass
+    return matched
+
+
+# ---------------------------------------------------------------------------
+# Row builders
+# ---------------------------------------------------------------------------
+
+COLUMNS = [
+    "Resource Type",
+    "Resource ID",
+    "Resource Name/Tag",
+    "Linked To Instance",
+    "Region",
+    "Usage Metric",
+    "Usage Quantity",
+    "Unit Cost",
+    "Total Cost (USD)",
+    "Billing Period",
+    "Cost Allocation Type",
+    "Notes",
+]
+
+
+def make_row(
+    resource_type: str,
+    resource_id: str,
+    resource_name: str,
+    linked_to: str,
+    region: str,
+    usage_metric: str,
+    usage_qty,
+    unit_cost,
+    total_cost,
+    billing_period: str,
+    cost_alloc: str,
+    notes: str,
+) -> dict:
+    return {
+        "Resource Type": resource_type,
+        "Resource ID": resource_id,
+        "Resource Name/Tag": resource_name,
+        "Linked To Instance": linked_to,
+        "Region": region,
+        "Usage Metric": usage_metric,
+        "Usage Quantity": round(float(usage_qty), 4) if usage_qty else 0,
+        "Unit Cost": round(float(unit_cost), 6) if unit_cost else 0,
+        "Total Cost (USD)": round(float(total_cost), 4) if total_cost else 0,
+        "Billing Period": billing_period,
+        "Cost Allocation Type": cost_alloc,
+        "Notes": notes,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main data collection
+# ---------------------------------------------------------------------------
+
+def collect_data(
+    session,
+    instance_id: str,
+    region: str,
+    start: str,
+    end: str,
+    account_id: str,
+) -> tuple[list[dict], str]:
+    ec2   = session.client("ec2")
+    logs  = session.client("logs")
+
+    # Always estimate for exactly 30 days regardless of date range passed
+    DAYS  = 30
+    HOURS = DAYS * 24   # 720
+    billing_period = f"30-Day Estimate ({start} to {end})"
+    rows  = []
+
+    # ------------------------------------------------------------------ pricing tables (ap-southeast-1, Linux on-demand)
+    EC2_PRICE = {
+        "t2.micro":0.0116,  "t2.small":0.023,    "t2.medium":0.0464,  "t2.large":0.0928,  "t2.xlarge":0.1856,
+        "t3.micro":0.0104,  "t3.small":0.0208,   "t3.medium":0.0416,  "t3.large":0.0832,
+        "t3.xlarge":0.1664, "t3.2xlarge":0.3328,
+        "t3a.micro":0.0094, "t3a.small":0.0188,  "t3a.medium":0.0376, "t3a.large":0.0752,
+        "t4g.micro":0.0084, "t4g.small":0.0168,  "t4g.medium":0.0336, "t4g.large":0.0672,
+        "m5.large":0.096,   "m5.xlarge":0.192,   "m5.2xlarge":0.384,  "m5.4xlarge":0.768,
+        "m5a.large":0.086,  "m5a.xlarge":0.172,  "m5a.2xlarge":0.344,
+        "m6i.large":0.096,  "m6i.xlarge":0.192,  "m6i.2xlarge":0.384, "m6i.4xlarge":0.768,
+        "m6g.large":0.077,  "m6g.xlarge":0.154,  "m6g.2xlarge":0.308,
+        "c5.large":0.085,   "c5.xlarge":0.170,   "c5.2xlarge":0.340,  "c5.4xlarge":0.680,
+        "c6i.large":0.085,  "c6i.xlarge":0.170,  "c6i.2xlarge":0.340,
+        "c6g.large":0.068,  "c6g.xlarge":0.136,  "c6g.2xlarge":0.272,
+        "r5.large":0.126,   "r5.xlarge":0.252,   "r5.2xlarge":0.504,  "r5.4xlarge":1.008,
+        "r6i.large":0.126,  "r6i.xlarge":0.252,  "r6i.2xlarge":0.504,
+        "r6g.large":0.101,  "r6g.xlarge":0.202,  "r6g.2xlarge":0.403,
+        "i3.large":0.156,   "i3.xlarge":0.312,   "i3.2xlarge":0.624,  "i3.4xlarge":1.248,
+        "i3en.large":0.226, "i3en.xlarge":0.452, "i3en.2xlarge":0.904,
+    }
+    EBS_PRICE   = {"gp3":0.08, "gp2":0.10, "io1":0.125, "io2":0.125, "st1":0.045, "sc1":0.015}
+    IOPS_PRICE  = {"io1":0.065, "io2":0.065}   # $/provisioned IOPS-month
+    SNAP_PRICE  = 0.05    # $/GB-month
+    RDS_PRICE   = {
+        "db.t3.micro":0.021,  "db.t3.small":0.042,  "db.t3.medium":0.084,
+        "db.t3.large":0.168,  "db.t3.xlarge":0.336, "db.t3.2xlarge":0.672,
+        "db.t4g.micro":0.018, "db.t4g.small":0.036, "db.t4g.medium":0.072,
+        "db.m5.large":0.171,  "db.m5.xlarge":0.342, "db.m5.2xlarge":0.684,
+        "db.m6g.large":0.154, "db.m6g.xlarge":0.308,"db.m6g.2xlarge":0.616,
+        "db.r5.large":0.240,  "db.r5.xlarge":0.480, "db.r5.2xlarge":0.960,
+        "db.r6g.large":0.216, "db.r6g.xlarge":0.432,"db.r6g.2xlarge":0.864,
+    }
+
+    # ------------------------------------------------------------------ EC2 Instance
+    print(f"[INFO] Fetching EC2 instance: {instance_id} ...")
+    inst          = get_instance_details(ec2, instance_id)
+    instance_type = inst.get("InstanceType", "")
+    az            = inst.get("Placement", {}).get("AvailabilityZone", region)
+    inst_name     = tag_value(inst.get("Tags", []), "Name") or instance_id
+    state         = inst.get("State", {}).get("Name", "unknown")
+    sg_ids        = [sg["GroupId"] for sg in inst.get("SecurityGroups", [])]
+    print(f"[INFO] Instance: {inst_name} | Type: {instance_type} | State: {state}")
+    print(f"[INFO] Security Groups: {', '.join(sg_ids) or 'none'}")
+
+    ec2_unit = Decimal(str(EC2_PRICE.get(instance_type, 0.05)))
+    # Stopped instances pay $0 compute (EBS still billed)
+    if state == "stopped":
+        ec2_cost  = Decimal("0")
+        ec2_notes = f"Instance STOPPED — compute $0. Type: {instance_type}, rate would be ${float(ec2_unit)}/hr if running"
+    else:
+        ec2_cost  = ec2_unit * HOURS
+        ec2_notes = f"Type: {instance_type}, state: {state}, rate: ${float(ec2_unit)}/hr × {HOURS}h"
+
+    rows.append(make_row(
+        "EC2 Instance", instance_id, inst_name, instance_id, region,
+        "Hours", HOURS, float(ec2_unit), ec2_cost,
+        billing_period, "Estimated", ec2_notes
+    ))
+
+    # ------------------------------------------------------------------ EBS Volumes
+    print("[INFO] Fetching EBS volumes...")
+    volumes    = get_ebs_volumes(ec2, instance_id)
+    volume_ids = []
+    for vol in volumes:
+        vid       = vol["VolumeId"]
+        volume_ids.append(vid)
+        vol_name  = tag_value(vol.get("Tags", []), "Name") or vid
+        size_gb   = vol.get("Size", 0)
+        vol_type  = vol.get("VolumeType", "gp2")
+        iops_prov = vol.get("Iops", 0)
+        throughput= vol.get("Throughput", 0)
+
+        unit_price   = EBS_PRICE.get(vol_type, 0.10)
+        storage_cost = Decimal(str(round(size_gb * unit_price, 4)))
+        iops_cost    = Decimal("0")
+        iops_note    = ""
+
+        if vol_type in IOPS_PRICE and iops_prov:
+            iops_cost = Decimal(str(round(iops_prov * IOPS_PRICE[vol_type], 4)))
+            iops_note = f", provisioned IOPS: {iops_prov} @ ${IOPS_PRICE[vol_type]}/IOPS-month = ${float(iops_cost):.4f}"
+
+        total_ebs = storage_cost + iops_cost
+        tput_note = f", throughput: {throughput} MB/s" if throughput else ""
+        rows.append(make_row(
+            "EBS Volume", vid, vol_name, instance_id, region,
+            "GB-month", size_gb, unit_price, total_ebs,
+            billing_period, "Estimated",
+            f"Type: {vol_type}, size: {size_gb} GB, AZ: {az}{iops_note}{tput_note}"
+        ))
+
+    # ------------------------------------------------------------------ EBS Snapshots
+    print("[INFO] Fetching EBS snapshots...")
+    snapshots = get_ebs_snapshots(ec2, volume_ids, account_id)
+    for snap in snapshots:
+        sid       = snap["SnapshotId"]
+        snap_size = snap.get("VolumeSize", 0)
+        snap_name = tag_value(snap.get("Tags", []), "Name") or sid
+        snap_cost = Decimal(str(round(snap_size * SNAP_PRICE, 4)))
+        rows.append(make_row(
+            "EBS Snapshot", sid, snap_name,
+            volume_ids[0] if volume_ids else instance_id, region,
+            "GB-month", snap_size, SNAP_PRICE, snap_cost,
+            billing_period, "Estimated",
+            f"Snapshot of {snap.get('VolumeId','unknown')}, size: {snap_size} GB"
+        ))
+
+    # ------------------------------------------------------------------ Elastic IPs
+    print("[INFO] Fetching Elastic IPs...")
+    eips = get_elastic_ips(ec2, instance_id)
+    for eip in eips:
+        alloc_id = eip.get("AllocationId", eip.get("PublicIp", ""))
+        pub_ip   = eip.get("PublicIp", "")
+        rows.append(make_row(
+            "Elastic IP", alloc_id, pub_ip, instance_id, region,
+            "Hours", HOURS, 0.0, Decimal("0"),
+            billing_period, "Direct",
+            "No charge while associated with a running instance"
+        ))
+
+    # ------------------------------------------------------------------ Load Balancers (SG-matched)
+    print("[INFO] Fetching Load Balancers by Security Group...")
+    lbs = get_load_balancers(session, sg_ids)
+    for lb in lbs:
+        lb_arn    = lb.get("LoadBalancerArn", "")
+        lb_name   = lb.get("LoadBalancerName", "")
+        lb_type   = lb.get("Type", "application")
+        shared_sgs= list(set(lb.get("SecurityGroups", [])) & set(sg_ids))
+        # ALB: $0.0225/hr + $0.008/LCU-hr (est 10 LCUs)  |  NLB: $0.0225/hr + $0.006/LCU-hr
+        hr_rate   = Decimal("0.0225")
+        lcu_rate  = Decimal("0.008") if lb_type == "application" else Decimal("0.006")
+        est_lcus  = 10
+        lb_cost   = (hr_rate + lcu_rate * est_lcus) * HOURS
+        rows.append(make_row(
+            f"ELB ({lb_type.upper()})", lb_arn, lb_name,
+            f"Shared SG: {', '.join(shared_sgs)}", region,
+            "Hours", HOURS, float(hr_rate + lcu_rate * est_lcus), lb_cost,
+            billing_period, "Estimated",
+            f"${float(hr_rate)}/hr + {est_lcus} LCUs × ${float(lcu_rate)}/LCU-hr | SG: {', '.join(shared_sgs)}"
+        ))
+
+    # ------------------------------------------------------------------ NAT Gateways (SG-matched)
+    print("[INFO] Fetching NAT Gateways by Security Group subnet overlap...")
+    ngws = get_nat_gateways(ec2, sg_ids)
+    for ngw in ngws:
+        ngw_id   = ngw.get("NatGatewayId", "")
+        ngw_name = tag_value(ngw.get("Tags", []), "Name") or ngw_id
+        # $0.045/hr + $0.045/GB processed (estimate 10 GB/day = 300 GB/month)
+        ngw_gb   = 300
+        ngw_cost = Decimal("0.045") * HOURS + Decimal("0.045") * ngw_gb
+        rows.append(make_row(
+            "NAT Gateway", ngw_id, ngw_name,
+            f"Subnet {ngw.get('SubnetId','')} (SG-linked)", region,
+            "Hours + GB", f"{HOURS}h + {ngw_gb}GB", 0.045, ngw_cost,
+            billing_period, "Estimated",
+            f"$0.045/hr × {HOURS}h + $0.045/GB × {ngw_gb}GB (est 10 GB/day) | subnet: {ngw.get('SubnetId','')}"
+        ))
+
+    # ------------------------------------------------------------------ RDS Instances (SG-matched)
+    print("[INFO] Fetching RDS instances by Security Group...")
+    rds_instances = get_rds_instances(session, sg_ids)
+    for db in rds_instances:
+        db_id        = db.get("DBInstanceIdentifier", "")
+        db_class     = db.get("DBInstanceClass", "")
+        engine       = db.get("Engine", "")
+        engine_ver   = db.get("EngineVersion", "")
+        multi_az     = db.get("MultiAZ", False)
+        storage_gb   = db.get("AllocatedStorage", 0)
+        storage_type = db.get("StorageType", "gp2")
+        iops_prov    = db.get("Iops", 0)
+        db_state     = db.get("DBInstanceStatus", "unknown")
+        db_sgs       = [sg["VpcSecurityGroupId"] for sg in db.get("VpcSecurityGroups", [])]
+        shared_sgs   = list(set(db_sgs) & set(sg_ids))
+
+        rds_hr     = Decimal(str(RDS_PRICE.get(db_class, 0.10)))
+        ma_mult    = Decimal("2") if multi_az else Decimal("1")
+        inst_cost  = rds_hr * HOURS * ma_mult
+        stor_cost  = Decimal(str(round(storage_gb * 0.115, 4)))
+        iops_cost  = Decimal(str(round(iops_prov * 0.10, 4))) if iops_prov else Decimal("0")
+        rds_cost   = inst_cost + stor_cost + iops_cost
+
+        iops_note  = f", IOPS: {iops_prov} @ $0.10/IOPS-month" if iops_prov else ""
+        rows.append(make_row(
+            "RDS Instance", db_id, db_id,
+            f"Shared SG: {', '.join(shared_sgs)}", region,
+            "Instance-hours", HOURS, float(rds_hr), rds_cost,
+            billing_period, "Estimated",
+            f"Engine: {engine} {engine_ver}, class: {db_class}, state: {db_state}, "
+            f"storage: {storage_gb} GB ({storage_type}){iops_note}, "
+            f"MultiAZ: {multi_az}, rate: ${float(rds_hr)}/hr, matched via SG: {', '.join(shared_sgs)}"
+        ))
+
+    # ------------------------------------------------------------------ Route 53
+    print("[INFO] Scanning Route 53 hosted zones for records pointing to this instance...")
+    public_ips   = [inst.get("PublicIpAddress", "")] + [e.get("PublicIp", "") for e in eips]
+    public_ips   = [ip for ip in public_ips if ip]
+    elb_dns_names= [lb.get("DNSName", "") for lb in lbs]
+    r53_records  = get_route53_records(session, public_ips, elb_dns_names)
+
+    seen_zones   = {}   # zone_id → zone_name, count records
+    for rec in r53_records:
+        zid  = rec["zone_id"]
+        seen_zones.setdefault(zid, {"name": rec["zone_name"], "records": []})
+        seen_zones[zid]["records"].append(rec)
+
+    for zid, zdata in seen_zones.items():
+        rec_names  = ", ".join(r["record_name"].rstrip(".") for r in zdata["records"])
+        rec_types  = ", ".join(r["record_type"] for r in zdata["records"])
+        num_records= len(zdata["records"])
+        # $0.50/hosted zone/month + $0.40/million queries (estimate 100K queries/month)
+        r53_cost   = Decimal("0.50") + Decimal(str(round(0.1 * 0.40, 4)))
+        rows.append(make_row(
+            "Route 53", zid, zdata["name"].rstrip("."),
+            instance_id, "global",
+            "Hosted zone + queries", num_records, 0.50, r53_cost,
+            billing_period, "Estimated",
+            f"Zone: {zdata['name'].rstrip('.')}, {num_records} record(s): {rec_names} ({rec_types}) | "
+            f"$0.50/zone + est 100K queries × $0.40/million"
+        ))
+
+    if not r53_records:
+        print("[INFO] No Route 53 records found pointing to this instance or its load balancers.")
+
+    # ------------------------------------------------------------------ CloudWatch
+    print("[INFO] Fetching CloudWatch log groups...")
+    log_groups = get_cloudwatch_log_groups(logs, instance_id)
+    if log_groups:
+        for lg in log_groups:
+            # $0.50/GB ingested, estimate 1 GB/month per group
+            rows.append(make_row(
+                "CloudWatch Logs", lg, lg, instance_id, region,
+                "GB ingested", 1, 0.50, Decimal("0.50"),
+                billing_period, "Estimated",
+                "Estimated 1 GB/month ingestion; $0.03/GB storage after first free tier"
+            ))
+    else:
+        # Basic metrics: ~5 default metrics, $0.30/metric/month
+        rows.append(make_row(
+            "CloudWatch Metrics", f"metrics/{instance_id}", "EC2 Default Metrics",
+            instance_id, region,
+            "Metrics", 5, 0.30, Decimal("1.50"),
+            billing_period, "Estimated",
+            "5 default EC2 metrics × $0.30/metric/month"
+        ))
+
+    # ------------------------------------------------------------------ Data Transfer
+    # Outbound internet @ $0.09/GB (ap-southeast-1)
+    # Actual usage: ~2 MB/month (small repo, minimal outbound)
+    dt_mb   = 2
+    dt_gb   = round(dt_mb / 1024, 6)          # 0.001953 GB
+    dt_cost = Decimal(str(round(dt_gb * 0.09, 6)))
+    rows.append(make_row(
+        "EC2-Other (Data Transfer)", f"dt/{instance_id}", "Outbound to Internet",
+        instance_id, region,
+        "MB", dt_mb, 0.09 / 1024, dt_cost,
+        billing_period, "Estimated",
+        f"~{dt_mb} MB/month outbound (small repo ~10 MB, minimal transfers) @ $0.09/GB (ap-southeast-1)"
+    ))
+
+    # ------------------------------------------------------------------ ElastiCache (SG-matched)
+    print("[INFO] Fetching ElastiCache clusters by Security Group...")
+    EC_PRICE = {
+        "cache.t3.micro":0.017,  "cache.t3.small":0.034,  "cache.t3.medium":0.068,
+        "cache.t4g.micro":0.016, "cache.t4g.small":0.032, "cache.t4g.medium":0.064,
+        "cache.m5.large":0.127,  "cache.m5.xlarge":0.254, "cache.m5.2xlarge":0.508,
+        "cache.r5.large":0.185,  "cache.r5.xlarge":0.370, "cache.r5.2xlarge":0.740,
+        "cache.r6g.large":0.166, "cache.r6g.xlarge":0.332,"cache.r6g.2xlarge":0.664,
+    }
+    for cluster in get_elasticache_clusters(session, sg_ids):
+        cid        = cluster.get("CacheClusterId", "")
+        node_type  = cluster.get("CacheNodeType", "")
+        engine     = cluster.get("Engine", "")
+        num_nodes  = cluster.get("NumCacheNodes", 1)
+        c_state    = cluster.get("CacheClusterStatus", "unknown")
+        shared_sgs = list(set(cluster.get("_matched_sgs", [])) & set(sg_ids))
+        ec_hr      = Decimal(str(EC_PRICE.get(node_type, 0.05)))
+        ec_cost    = ec_hr * HOURS * num_nodes
+        rows.append(make_row(
+            "ElastiCache", cid, cid,
+            f"Shared SG: {', '.join(shared_sgs)}", region,
+            "Node-hours", HOURS * num_nodes, float(ec_hr), ec_cost,
+            billing_period, "Estimated",
+            f"Engine: {engine}, node type: {node_type}, nodes: {num_nodes}, state: {c_state}, "
+            f"rate: ${float(ec_hr)}/hr, matched via SG: {', '.join(shared_sgs)}"
+        ))
+
+    return rows, inst_name
+
+
+# ---------------------------------------------------------------------------
+# Excel writer
+# ---------------------------------------------------------------------------
+
+def write_excel(rows: list[dict], output_path: str, instance_id: str, inst_name: str, start: str, end: str):
+    df = pd.DataFrame(rows, columns=COLUMNS)
+
+    # Add a summary total row
+    total_cost = df["Total Cost (USD)"].sum()
+    total_row = {col: "" for col in COLUMNS}
+    total_row["Resource Type"] = "TOTAL"
+    total_row["Total Cost (USD)"] = round(total_cost, 4)
+    total_row["Notes"] = f"Sum of all costs for instance {instance_id}, {start} to {end}"
+    df = pd.concat([df, pd.DataFrame([total_row])], ignore_index=True)
+
+    df.to_excel(output_path, index=False, sheet_name="Cost Report")
+
+    # Styling
+    wb = load_workbook(output_path)
+    ws = wb.active
+
+    header_fill = PatternFill(start_color="1F3864", end_color="1F3864", fill_type="solid")
+    total_fill = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
+    alt_fill = PatternFill(start_color="EBF3FB", end_color="EBF3FB", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    total_font = Font(bold=True, size=11)
+    thin = Side(border_style="thin", color="B0B0B0")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    # Header row
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = border
+
+    ws.row_dimensions[1].height = 30
+
+    # Data rows
+    total_row_idx = ws.max_row
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2), start=2):
+        is_total = row_idx == total_row_idx
+        for cell in row:
+            cell.border = border
+            cell.alignment = Alignment(vertical="center", wrap_text=False)
+            if is_total:
+                cell.fill = total_fill
+                cell.font = total_font
+            elif row_idx % 2 == 0:
+                cell.fill = alt_fill
+
+    # Column widths
+    col_widths = {
+        "A": 20, "B": 30, "C": 25, "D": 22, "E": 12,
+        "F": 20, "G": 16, "H": 12, "I": 18, "J": 24,
+        "K": 22, "L": 50,
+    }
+    for col_letter, width in col_widths.items():
+        ws.column_dimensions[col_letter].width = width
+
+    # Freeze header row
+    ws.freeze_panes = "A2"
+
+    # Number format for cost columns
+    for row in ws.iter_rows(min_row=2, min_col=9, max_col=9):  # Total Cost (USD)
+        for cell in row:
+            if isinstance(cell.value, (int, float)):
+                cell.number_format = '"$"#,##0.0000'
+
+    # Add metadata above the table in a note
+    ws.insert_rows(1, 3)
+    meta_cell = ws["A1"]
+    meta_cell.value = (
+        f"AWS Cost Report  |  Instance: {inst_name} ({instance_id})  |  "
+        f"30-Day Estimate: {start} to {end}  |  Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+    )
+    meta_cell.font = Font(bold=True, size=12, color="1F3864")
+    ws.merge_cells("A1:L1")
+    meta_cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 22
+    ws.row_dimensions[2].height = 6  # spacer
+
+    wb.save(output_path)
+    print(f"[DONE] Report saved to: {os.path.abspath(output_path)}")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    args = parse_args()
+
+    # Priority: CLI args > CONFIG block > prompt/defaults
+    instance_id = args.instance_id or INSTANCE_ID
+    if not instance_id:
+        instance_id = input("Enter EC2 Instance ID (e.g. i-0abc123def456789): ").strip()
+        if not instance_id:
+            sys.exit("ERROR: Instance ID is required.")
+
+    region = args.region or REGION or None
+    if not region:
+        region = input("Enter AWS Region (leave blank to use profile default): ").strip() or None
+
+    # Date range: CLI > CONFIG > last DAYS_BACK days
+    end   = args.end   or END_DATE   or datetime.utcnow().strftime("%Y-%m-%d")
+    start = args.start or START_DATE or (
+        datetime.utcnow() - timedelta(days=DAYS_BACK)
+    ).strftime("%Y-%m-%d")
+
+    profile = args.profile or AWS_PROFILE or None
+    _base   = (args.output or OUTPUT_FILE).replace(".xlsx", "")
+
+    print(f"\n[CONFIG] Instance ID : {instance_id}")
+    print(f"[CONFIG] Region      : {region or '(profile default)'}")
+    print(f"[CONFIG] Period      : {start} → {end}  ({DAYS_BACK}-day window)")
+    print(f"[CONFIG] Output      : {_base}_<instance-name>_<timestamp>.xlsx\n")
+
+    session = create_session(profile, region)
+
+    # Resolve effective region if not supplied
+    if not region:
+        region = session.region_name or "us-east-1"
+
+    # Get account ID
+    sts = session.client("sts")
+    account_id = sts.get_caller_identity()["Account"]
+
+    rows, inst_name = collect_data(session, instance_id, region, start, end, account_id)
+
+    if not rows:
+        sys.exit("No data collected. Verify Instance ID, region, and permissions.")
+
+    safe_name = inst_name.replace(" ", "_").replace("/", "-")
+    output    = f"{_base}_{safe_name}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.xlsx"
+
+    write_excel(rows, output, instance_id, inst_name, start, end)
+    print(f"\n[SUMMARY] Total rows: {len(rows)} | Output: {output}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nAborted.")
+    except Exception as e:
+        print(f"\nFATAL ERROR: {e}")
+        traceback.print_exc()
+        sys.exit(1)
